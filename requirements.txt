@@ -1,0 +1,4 @@
+azure-kusto-data>=4.3.0
+pandas>=2.0.0
+requests>=2.32.0
+clickhouse-connect>=0.7.0
