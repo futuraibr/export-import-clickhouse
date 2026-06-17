@@ -1,5 +1,8 @@
+"""Puxa os dados do ADX e salva em CSV (um por processo, separado por mês) na pasta dump."""
+
 import argparse
 import os
+import sys
 from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -7,19 +10,22 @@ import pandas as pd
 from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
 from azure.kusto.data.helpers import dataframe_from_result_table
 
-# ──────────────────────────────────────────────
-# Configuração
-# ──────────────────────────────────────────────
+# acha a raiz do projeto pra conseguir importar o common/
+_root = os.path.dirname(os.path.abspath(__file__))
+while _root != os.path.dirname(_root) and not os.path.isdir(os.path.join(_root, "common")):
+    _root = os.path.dirname(_root)
+sys.path.insert(0, _root)
+
+from common import config
+
 TEST_MODE = False
 
-CLUSTER_URI = "https://futurai.brazilsouth.kusto.windows.net"
-DATABASE    = "variables_dev"
-TABLE       = "variables_a57d9b153ff144d9a2b6e7e8e3a04dc3"
-OUTPUT_DIR  = "output"
-DAYS_BACK   = 180
-
-# Limite seguro abaixo do teto de 500k do ADX
-CHUNK_LIMIT = 400_000
+CLUSTER_URI = config.ADX_CLUSTER_URI
+DATABASE    = config.ADX_DATABASE
+TABLE       = config.ADX_TABLE
+DUMP_DIR    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dump", "dev")  # onde os CSVs são salvos
+DAYS_BACK   = config.DAYS_BACK
+CHUNK_LIMIT = config.CHUNK_LIMIT
 
 TEST_PROCESS_ID = "c1d85a0a3619494580b013a63c3899b7"
 
@@ -87,11 +93,7 @@ def _execute_range_query(client: KustoClient, process_id: str, start: datetime, 
 
 
 def fetch_chunks(client: KustoClient, process_id: str, start: datetime, end: datetime, source_timezone: str) -> list[pd.DataFrame]:
-    """
-    Tenta buscar o intervalo inteiro. Se o ADX recusar por excesso de linhas,
-    divide o intervalo ao meio e tenta cada metade recursivamente.
-    Retorna uma lista de DataFrames, cada um abaixo do limite do ADX.
-    """
+    """Busca o período; se o ADX reclamar que tem linha demais, parte no meio e tenta de novo."""
     try:
         df = _execute_range_query(client, process_id, start, end, source_timezone)
         if len(df) == 0:
@@ -107,12 +109,7 @@ def fetch_chunks(client: KustoClient, process_id: str, start: datetime, end: dat
 
 
 def save_chunks(chunks: list[pd.DataFrame], month_dir: str, process_id: str) -> tuple[int, int]:
-    """
-    Salva os chunks em disco.
-    - 1 chunk  → processo_{id}.csv
-    - N chunks → processo_{id}-parte1.csv, parte2.csv, ...
-    Retorna (total de linhas salvas, número de arquivos).
-    """
+    """Salva em CSV: um arquivo só, ou vários (-parte1, -parte2...) quando vem dividido."""
     os.makedirs(month_dir, exist_ok=True)
     total_rows = sum(len(c) for c in chunks)
 
@@ -196,7 +193,7 @@ def main():
                     print(f"        [{label}] sem dados, pulando")
                     continue
 
-                month_dir = os.path.join(OUTPUT_DIR, label)
+                month_dir = os.path.join(DUMP_DIR, label)
                 saved_rows, n_parts = save_chunks(chunks, month_dir, process_id)
 
                 if n_parts == 1:
@@ -213,7 +210,7 @@ def main():
     print(f"  Extração concluída.")
     print(f"  Ignorados (0 linhas) : {skipped}")
     print(f"  Erros                : {errors}")
-    print(f"  Saída                : ./{OUTPUT_DIR}/")
+    print(f"  Saída                : {DUMP_DIR}/")
     print(f"{'='*57}\n")
 
 

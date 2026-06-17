@@ -1,6 +1,12 @@
 .env
+.env.example
 __pycache__/
 *.pyc
 .pytest_cache
 .venv/
-output/
+
+# Dados: versiona só a ESTRUTURA das pastas (via .gitkeep), ignora o CONTEÚDO
+sources/**/dump/*/*
+sources/**/made/*/*
+sources/**/output/*/*
+!**/.gitkeep

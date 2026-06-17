@@ -1,0 +1,235 @@
+"""
+Dicas de uso:
+  --dry-run            só mostra como ficaria, sem inserir
+  --file <arquivo>     processa um arquivo só (bom pra conferir antes)
+"""
+
+import argparse
+import glob
+import gzip
+import json
+import math
+import os
+import sys
+import time
+
+# acha a raiz do projeto pra conseguir importar o common/
+_root = os.path.dirname(os.path.abspath(__file__))
+while _root != os.path.dirname(_root) and not os.path.isdir(os.path.join(_root, "common")):
+    _root = os.path.dirname(_root)
+sys.path.insert(0, _root)
+
+import pandas as pd
+# só o tradutor do formato do DynamoDB — roda offline, NÃO conecta na AWS nem usa credencial
+from boto3.dynamodb.types import TypeDeserializer
+
+from common import config
+from common.clickhouse import get_clickhouse_client, insert_dataframe
+from common.progress import load_enviados, move_to_processed, upsert_entry, write_enviados_log
+
+CH_DATABASE = config.CH_DATABASE
+PRED_TABLE  = config.PREDICTIONS_TABLE
+BATCH_ROWS  = config.PRED_BATCH_ROWS
+COMPANY_ID  = config.COMPANY_ID
+
+# pastas separadas por ambiente — dev usa a subpasta dev (dump/dev, made/dev, output/dev)
+_BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+DUMP_DIR   = os.path.join(_BASE_DIR, "dump", "dev")
+MADE_DIR   = os.path.join(_BASE_DIR, "made", "dev")
+OUTPUT_DIR = os.path.join(_BASE_DIR, "output", "dev")
+ENVIADOS_LOG = os.path.join(OUTPUT_DIR, ".enviados.log")
+
+# colunas da tabela, na ordem do insert
+COLUMNS = ["company_id", "process_id", "ts", "index", "threshold"]
+
+_deserializer = TypeDeserializer()
+
+
+# a tabela já existe no ClickHouse (criada fora daqui); este script só insere
+OPTIMIZE_TABLE_SQL = f"OPTIMIZE TABLE {CH_DATABASE}.{PRED_TABLE} FINAL"
+
+
+def optimize_table(client):
+    """Junta de vez as linhas repetidas (assim não precisa de FINAL nas consultas)."""
+    print(f"Consolidando tabela: {OPTIMIZE_TABLE_SQL}")
+    client.command(OPTIMIZE_TABLE_SQL)
+    print("OK — tabela consolidada (queries não precisam de FINAL)\n")
+
+
+def discover_files(base_dir: str, single_file: str | None) -> list[str]:
+    """Lista os .gz da pasta (ou um arquivo só), ignorando os manifest do export."""
+    if single_file:
+        return [single_file]
+    found = set(glob.glob(os.path.join(base_dir, "**", "*.json.gz"), recursive=True))
+    found |= set(glob.glob(os.path.join(base_dir, "**", "*.gz"), recursive=True))
+    files = [f for f in found if not os.path.basename(f).startswith("manifest-")]
+    return sorted(files)
+
+
+def flatten_item(item: dict) -> dict:
+    """Desembrulha o JSON tipado do DynamoDB ({"S": ...}) num dict normal — só texto, sem AWS."""
+    return {k: _deserializer.deserialize(v) for k, v in item.items()}
+
+
+def record_from_flat(flat: dict) -> dict | None:
+    """Monta a linha pro ClickHouse; devolve None quando o item não serve (ignora `model`)."""
+    process_id = flat.get("process_id")
+    raw_ts     = flat.get("timestamp")
+    raw_index  = flat.get("index")
+    raw_thr    = flat.get("threshold")
+
+    if process_id is None or raw_ts is None or raw_index is None or raw_thr is None:
+        return None
+
+    try:
+        idx = float(raw_index)
+        thr = float(raw_thr)
+    except (TypeError, ValueError):
+        return None
+
+    if math.isnan(idx) or math.isinf(idx) or math.isnan(thr) or math.isinf(thr):
+        return None
+
+    return {
+        "company_id": str(flat.get("company_id") or COMPANY_ID),
+        "process_id": str(process_id),
+        "ts":         str(raw_ts),
+        "index":      idx,
+        "threshold":  thr,
+    }
+
+
+def read_file(path: str, limit: int | None):
+    """Lê o arquivo linha por linha (aceita .gz ou .json) e devolve as linhas + contagens."""
+    records = []
+    stats = {"read": 0, "accepted": 0, "discarded": 0}
+
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            stats["read"] += 1
+
+            obj = json.loads(line)
+            item = obj.get("Item", obj)   # cada linha do export vem como {"Item": {...}}
+            rec = record_from_flat(flatten_item(item))
+
+            if rec is None:
+                stats["discarded"] += 1
+            else:
+                records.append(rec)
+                stats["accepted"] += 1
+
+            if limit is not None and stats["read"] >= limit:
+                break
+
+    return records, stats
+
+
+def to_dataframe(records: list[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(records, columns=COLUMNS)
+    if not df.empty:
+        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    return df
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Importa Predictions (.json.gz do DynamoDB) para o ClickHouse.")
+    parser.add_argument("--dry-run", action="store_true", help="Lê e transforma, mostra amostra e estatísticas, NÃO insere.")
+    parser.add_argument("--file", help="Processa só este arquivo .gz (valida o 1º antes dos demais).")
+    parser.add_argument("--limit", type=int, help="Processa só as N primeiras linhas de cada arquivo.")
+    parser.add_argument("--no-optimize", action="store_true", help="Não roda OPTIMIZE TABLE ... FINAL ao fim da carga real.")
+    args = parser.parse_args()
+
+    files = discover_files(DUMP_DIR, args.file)
+
+    print(f"\n{'='*57}")
+    print(f"  Host         : {config.CH_HOST}:{config.CH_PORT}")
+    print(f"  Tabela       : {CH_DATABASE}.{PRED_TABLE}")
+    print(f"  Pasta dump   : {DUMP_DIR}")
+    print(f"  Pasta made   : {MADE_DIR}")
+    print(f"  Arquivos     : {len(files)}")
+    print(f"  Batch        : {BATCH_ROWS:,} linhas")
+    print(f"  Modo         : {'DRY-RUN (sem inserir)' if args.dry_run else 'CARGA REAL'}")
+    print(f"{'='*57}\n")
+
+    client = None
+    if not args.dry_run:
+        client = get_clickhouse_client()
+        print("Conexão com ClickHouse OK\n")
+
+    if not files:
+        print(f"Nenhum arquivo .gz novo em '{DUMP_DIR}/' — nada a processar.")
+        print(f"Coloque novos arquivos exportados do DynamoDB nessa pasta e rode novamente.")
+        return
+
+    # na carga real, parte do que já foi enviado antes pra ir somando no log
+    entries      = [] if args.dry_run else load_enviados(ENVIADOS_LOG)
+    total_read   = 0
+    total_insert = 0
+    total_disc   = 0
+    start_all    = time.time()
+
+    for idx, path in enumerate(files, start=1):
+        rel = os.path.relpath(path, DUMP_DIR) if not args.file else path
+        print(f"[{idx}/{len(files)}] Processando arquivo {rel} ...")
+        t0 = time.time()
+
+        records, stats = read_file(path, args.limit)
+        df = to_dataframe(records)
+
+        inserted = 0
+        if args.dry_run:
+            sample = df.head(5)
+            if not sample.empty:
+                print("    amostra transformada:")
+                for line in sample.to_string(index=False).splitlines():
+                    print(f"      {line}")
+        else:
+            for b_start in range(0, len(df), BATCH_ROWS):
+                chunk = df.iloc[b_start:b_start + BATCH_ROWS]
+                insert_dataframe(client, PRED_TABLE, chunk, BATCH_ROWS)
+                inserted += len(chunk)
+                print(f"    Lote de {len(chunk):,} inserido com sucesso (acumulado arquivo: {inserted:,})")
+
+        elapsed = time.time() - t0
+        print(f"    OK  lidas={stats['read']:,}  válidas={stats['accepted']:,}  descartadas={stats['discarded']:,}  ({elapsed:.1f}s)")
+
+        total_read   += stats["read"]
+        total_insert += inserted
+        total_disc   += stats["discarded"]
+
+        if not args.dry_run:
+            # deu certo → manda o arquivo pra made
+            dest = move_to_processed(path, DUMP_DIR, MADE_DIR)
+            if dest:
+                print(f"    movido → {os.path.relpath(dest, MADE_DIR)} (made/)")
+            upsert_entry(entries, {
+                "file": rel,
+                "read": stats["read"],
+                "inserted": inserted,
+                "discarded": stats["discarded"],
+                "elapsed": f"{elapsed:.1f}s",
+            })
+            write_enviados_log(ENVIADOS_LOG, entries)   # vai atualizando o log a cada arquivo
+        print()
+
+    if not args.dry_run and total_insert > 0 and not args.no_optimize:
+        optimize_table(client)
+
+    elapsed_all = (time.time() - start_all) / 60
+    print(f"{'='*57}")
+    print(f"  Concluído em      : {elapsed_all:.1f} minutos")
+    print(f"  Arquivos rodada   : {len(files)}")
+    print(f"  Linhas lidas      : {total_read:,}")
+    print(f"  Linhas inseridas  : {total_insert:,}")
+    print(f"  Linhas descart.   : {total_disc:,}")
+    if not args.dry_run:
+        print(f"  Log de enviados   : {ENVIADOS_LOG}")
+    print(f"{'='*57}\n")
+
+
+if __name__ == "__main__":
+    main()
