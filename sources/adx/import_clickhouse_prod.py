@@ -6,6 +6,7 @@ ele fica em dump pra tentar na próxima vez.
 
 import glob
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -52,12 +53,34 @@ def process_csv(path: str, now_utc: datetime):
     df = pd.read_csv(path, parse_dates=["ts"])
     df["ts"] = df["ts"].dt.tz_convert(timezone.utc)  # garante UTC
 
-    df_valid, _, stats = apply_ingest_rules(df, now_utc, COMPANY_ID, build_logs=False)
+    df_valid, stats = apply_ingest_rules(df, now_utc, COMPANY_ID, max_past_hours=MAX_PAST_HOURS)
     return df_valid, stats
 
 
+def _sort_key(path: str):
+    """Ordena por processo (todos os meses de um processo juntos), depois mês e parte."""
+    base = os.path.basename(path)
+    month = os.path.basename(os.path.dirname(path))
+    m = re.search(r"processo_(.+?)(?:-parte(\d+))?\.csv$", base)
+    pid = m.group(1) if m else base
+    part = int(m.group(2)) if (m and m.group(2)) else 0
+    return (pid, month, part)
+
+
+def optimize_imported_partitions(client, months: set):
+    #Roda OPTIMIZE FINAL só nas partições (mês, company_id) que ESTE import tocou.
+    for month in sorted(months):
+        print(f"  OPTIMIZE {month} / {COMPANY_ID} ... ", end="", flush=True)
+        t0 = time.time()
+        client.command(
+            f"OPTIMIZE TABLE {CH_DATABASE}.{CH_TABLE} PARTITION ({int(month)}, '{COMPANY_ID}') FINAL",
+            settings={"alter_sync": 2},
+        )
+        print(f"OK ({time.time() - t0:.1f}s)")
+
+
 def main():
-    csv_files = sorted(f for f in glob.glob(CSV_GLOB, recursive=True) if f.endswith(".csv"))
+    csv_files = sorted((f for f in glob.glob(CSV_GLOB, recursive=True) if f.endswith(".csv")), key=_sort_key)
     # pula o que já está em made (já foi importado antes)
     pending = [f for f in csv_files if not already_processed(f, DUMP_DIR, MADE_DIR)]
 
@@ -78,12 +101,13 @@ def main():
     client = get_clickhouse_client()
     print("Conexão com ClickHouse OK\n")
 
-    now_utc      = datetime.now(timezone.utc)
-    entries      = load_enviados(ENVIADOS_LOG)
-    total_accept = 0
-    total_discard= 0
-    failed_files = []
-    start_time   = time.time()
+    now_utc       = datetime.now(timezone.utc)
+    entries       = load_enviados(ENVIADOS_LOG)
+    total_accept  = 0
+    total_discard = 0
+    failed_files  = []
+    touched_months = set()   # partições (mês) tocadas, pra dar OPTIMIZE só nelas no fim
+    start_time    = time.time()
 
     for idx, path in enumerate(pending, start=1):
         label = os.path.relpath(path, DUMP_DIR)
@@ -94,6 +118,7 @@ def main():
 
             if len(df) > 0:
                 insert_dataframe(client, CH_TABLE, df, BATCH_ROWS)
+                touched_months.update(df["ts"].dt.strftime("%Y%m"))
 
             total_accept  += stats["accepted"]
             total_discard += stats["discarded"]
@@ -125,6 +150,14 @@ def main():
         except Exception as exc:
             print(f"ERRO: {exc}")
             failed_files.append(path)
+
+    # consolida só as partições que este import tocou (não a tabela inteira)
+    if touched_months:
+        print(f"\nConsolidando {len(touched_months)} partição(ões) importada(s) (OPTIMIZE FINAL)...")
+        try:
+            optimize_imported_partitions(client, touched_months)
+        except Exception as exc:
+            print(f"  AVISO: OPTIMIZE falhou ({exc}). Os dados estão lá; rode o OPTIMIZE depois.")
 
     elapsed_min = (time.time() - start_time) / 60
     print(f"\n{'='*57}")

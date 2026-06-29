@@ -1,11 +1,3 @@
-"""
-[PROD] Igual ao import dev, só que grava no ClickHouse de PRODUÇÃO (common.clickhouse_prod).
-
-Dicas de uso:
-  --dry-run            só mostra como ficaria, sem inserir
-  --file <arquivo>     processa um arquivo só (bom pra conferir antes)
-"""
-
 import argparse
 import glob
 import gzip
@@ -23,7 +15,12 @@ sys.path.insert(0, _root)
 
 import pandas as pd
 # só o tradutor do formato do DynamoDB — roda offline, n conecta na AWS nem usa credencial
-from boto3.dynamodb.types import TypeDeserializer
+import decimal
+from boto3.dynamodb.types import TypeDeserializer, DYNAMODB_CONTEXT
+# alguns números vêm com +38 dígitos significativos; sem isso o boto3 estoura decimal.Rounded.
+# como convertemos pra float logo depois, deixar arredondar em silêncio é seguro.
+DYNAMODB_CONTEXT.traps[decimal.Inexact] = 0
+DYNAMODB_CONTEXT.traps[decimal.Rounded] = 0
 
 from common import config
 from common.clickhouse_prod import get_clickhouse_client, insert_dataframe
@@ -50,15 +47,17 @@ _NON_TAG_KEYS = {"process_id", "timestamp", "ts", "company_id", "model"}
 _deserializer = TypeDeserializer()
 
 
-# a tabela já existe no ClickHouse (criada fora daqui); este script só insere
-OPTIMIZE_TABLE_SQL = f"OPTIMIZE TABLE {CH_DATABASE}.{PROJ_TABLE} FINAL"
-
-
-def optimize_table(client):
-    """Junta de vez as linhas repetidas (assim não precisa de FINAL nas consultas)."""
-    print(f"Consolidando tabela: {OPTIMIZE_TABLE_SQL}")
-    client.command(OPTIMIZE_TABLE_SQL)
-    print("OK — tabela consolidada (queries não precisam de FINAL)\n")
+def optimize_imported_partitions(client, touched: set):
+    """OPTIMIZE FINAL só nas partições (mês, company_id) que ESTE import tocou — não a tabela
+    inteira. A partição é (toYYYYMM(ts), company_id), então fica barato mesmo com a tabela grande."""
+    for company_id, month in sorted(touched):
+        print(f"  OPTIMIZE {month} / {company_id} ... ", end="", flush=True)
+        t0 = time.time()
+        client.command(
+            f"OPTIMIZE TABLE {CH_DATABASE}.{PROJ_TABLE} PARTITION ({int(month)}, '{company_id}') FINAL",
+            settings={"alter_sync": 2},
+        )
+        print(f"OK ({time.time() - t0:.1f}s)")
 
 
 def discover_files(base_dir: str, single_file: str | None) -> list[str]:
@@ -118,11 +117,12 @@ def rows_from_flat(flat: dict) -> list[dict]:
     return rows
 
 
-def read_file(path: str, limit: int | None):
-    """Lê o arquivo item por item (aceita .gz ou .json) e devolve as linhas + contagens."""
-    records = []
-    stats = {"read": 0, "accepted": 0, "discarded": 0}
+def stream_records(path: str, limit: int | None, stats: dict):
+    """Gera as linhas item por item (aceita .gz ou .json), sem segurar o arquivo inteiro
+    na memória.
 
+    Antes o arquivo era lido todo de uma vez (lista + DataFrame inteiros), o que estourava
+    a RAM em arquivos grandes e derrubava o WSL."""
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as fh:
         for line in fh:
@@ -138,19 +138,36 @@ def read_file(path: str, limit: int | None):
             if not rows:
                 stats["discarded"] += 1
             else:
-                records.extend(rows)
                 stats["accepted"] += len(rows)
+                yield from rows
 
             if limit is not None and stats["read"] >= limit:
                 break
 
-    return records, stats
+
+HOURS_OFFSET = 3      # Dynamo entrega o ts naive (tratado como UTC); soma 3h, igual ao ADX
+ALT_HOURS_OFFSET = 4  # exceção: +4h (Manaus, UTC-4)
+# process_ids (sem hífen) que usam +4h em vez de +3h
+ALT_PROCESSES = {
+    "668dfaa49d19463e9fb0082f8ae52c2f",
+    "2e7fa9dccd574a1494a95b43ca76d5f2",
+    "567b3498d5d9469681fe1586591fbd9e",
+    "f0c7130974924b70a34b7b9516b1036c",
+    "b2fd0a766acd40819d8e34df4ba81c48",
+    "ef41b354e25948b49667f948694a0957",
+}
 
 
 def to_dataframe(records: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(records, columns=COLUMNS)
-    if not df.empty:
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    if df.empty:
+        return df
+    # +3h em todos; +1h extra (=+4h) nos process_ids de Manaus
+    df["ts"] = pd.to_datetime(df["ts"], utc=True) + pd.Timedelta(hours=HOURS_OFFSET)
+    extra = ALT_HOURS_OFFSET - HOURS_OFFSET
+    if extra:
+        manaus = df["process_id"].astype(str).str.replace("-", "", regex=False).str.lower().isin(ALT_PROCESSES)
+        df.loc[manaus, "ts"] += pd.Timedelta(hours=extra)
     return df
 
 
@@ -159,7 +176,6 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Lê e transforma, mostra amostra e estatísticas, NÃO insere.")
     parser.add_argument("--file", help="Processa só este arquivo .gz (valida o 1º antes dos demais).")
     parser.add_argument("--limit", type=int, help="Processa só os N primeiros itens de cada arquivo.")
-    parser.add_argument("--no-optimize", action="store_true", help="Não roda OPTIMIZE TABLE ... FINAL ao fim da carga real.")
     args = parser.parse_args()
 
     files = discover_files(DUMP_DIR, args.file)
@@ -172,6 +188,7 @@ def main():
     print(f"  Arquivos     : {len(files)}")
     print(f"  Batch        : {BATCH_ROWS:,} linhas")
     print(f"  Modo         : {'DRY-RUN (sem inserir)' if args.dry_run else 'CARGA REAL'}")
+    print(f"  Ajuste hora  : +{HOURS_OFFSET}h")
     print(f"{'='*57}\n")
 
     client = None
@@ -188,6 +205,7 @@ def main():
     total_read   = 0
     total_insert = 0
     total_disc   = 0
+    touched      = set()   # pares (company_id, mês) tocados, pra OPTIMIZE só neles no fim
     start_all    = time.time()
 
     for idx, path in enumerate(files, start=1):
@@ -195,22 +213,39 @@ def main():
         print(f"[{idx}/{len(files)}] Processando arquivo {rel} ...")
         t0 = time.time()
 
-        records, stats = read_file(path, args.limit)
-        df = to_dataframe(records)
-
+        stats = {"read": 0, "accepted": 0, "discarded": 0}
         inserted = 0
-        if args.dry_run:
-            sample = df.head(5)
-            if not sample.empty:
-                print("    amostra transformada (long):")
-                for line in sample.to_string(index=False).splitlines():
-                    print(f"      {line}")
-        else:
-            for b_start in range(0, len(df), BATCH_ROWS):
-                chunk = df.iloc[b_start:b_start + BATCH_ROWS]
-                insert_dataframe(client, PROJ_TABLE, chunk, BATCH_ROWS)
-                inserted += len(chunk)
-                print(f"    Lote de {len(chunk):,} inserido com sucesso (acumulado arquivo: {inserted:,})")
+        sample_shown = False
+        batch: list[dict] = []
+
+        def _flush(batch_rows):
+            """Converte o lote acumulado em DataFrame e insere (ou mostra amostra no dry-run)."""
+            nonlocal inserted, sample_shown
+            if not batch_rows:
+                return
+            df = to_dataframe(batch_rows)
+            if args.dry_run:
+                if not sample_shown:
+                    sample = df.head(5)
+                    if not sample.empty:
+                        print("    amostra transformada (long):")
+                        for sline in sample.to_string(index=False).splitlines():
+                            print(f"      {sline}")
+                    sample_shown = True
+            else:
+                insert_dataframe(client, PROJ_TABLE, df, BATCH_ROWS)
+                inserted += len(df)
+                touched.update(zip(df["company_id"], df["ts"].dt.strftime("%Y%m")))
+                print(f"    Lote de {len(df):,} inserido com sucesso (acumulado arquivo: {inserted:,})")
+
+        # streaming: acumula só BATCH_ROWS linhas por vez, insere e libera — memória limitada
+        for row in stream_records(path, args.limit, stats):
+            batch.append(row)
+            if len(batch) >= BATCH_ROWS:
+                _flush(batch)
+                batch = []
+        _flush(batch)   # resto do arquivo
+        batch = []
 
         elapsed = time.time() - t0
         print(f"    OK  itens={stats['read']:,}  linhas={stats['accepted']:,}  itens vazios={stats['discarded']:,}  ({elapsed:.1f}s)")
@@ -233,8 +268,13 @@ def main():
             write_enviados_log(ENVIADOS_LOG, entries)
         print()
 
-    if not args.dry_run and total_insert > 0 and not args.no_optimize:
-        optimize_table(client)
+    # consolida só as partições que este import tocou (não a tabela inteira)
+    if not args.dry_run and touched:
+        print(f"\nConsolidando {len(touched)} partição(ões) importada(s) (OPTIMIZE FINAL)...")
+        try:
+            optimize_imported_partitions(client, touched)
+        except Exception as exc:
+            print(f"  AVISO: OPTIMIZE falhou ({exc}). Os dados estão lá; rode o OPTIMIZE depois.")
 
     elapsed_all = (time.time() - start_all) / 60
     print(f"{'='*57}")

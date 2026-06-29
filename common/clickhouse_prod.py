@@ -1,10 +1,4 @@
-"""Conexão com o ClickHouse de PRODUÇÃO e inserção de DataFrames em lote.
-
-Igual ao clickhouse.py (dev), só que usa as variáveis CH_*_PROD do config.
-Pra rodar contra produção, é só trocar o import nos scripts:
-    from common.clickhouse import get_clickhouse_client      # dev
-    from common.clickhouse_prod import get_clickhouse_client  # prod
-"""
+"""Conexão com o ClickHouse de PRODUÇÃO e inserção de DataFrames em lote (vars CH_*_PROD do config)."""
 
 import clickhouse_connect
 import pandas as pd

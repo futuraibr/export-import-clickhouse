@@ -84,7 +84,7 @@ python sources/adx/import_clickhouse.py     # sobe os CSVs no ClickHouse dev
 ```bash
 # preencher antes no .env: ADX_*_PROD e CH_*_PROD
 python sources/adx/export_adx_prod.py       # puxa do ADX prod → dump/prod/
-python sources/adx/import_clickhouse_prod.py# sobe os CSVs no ClickHouse prod
+python sources/adx/import_clickhouse_prod.py # sobe os CSVs no ClickHouse prod
 ```
 
 ---

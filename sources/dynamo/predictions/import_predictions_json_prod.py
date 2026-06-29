@@ -23,7 +23,12 @@ sys.path.insert(0, _root)
 
 import pandas as pd
 # só o tradutor do formato do DynamoDB — roda offline, NÃO conecta na AWS nem usa credencial
-from boto3.dynamodb.types import TypeDeserializer
+import decimal
+from boto3.dynamodb.types import TypeDeserializer, DYNAMODB_CONTEXT
+# alguns números vêm com +38 dígitos significativos; sem isso o boto3 estoura decimal.Rounded.
+# como convertemos pra float logo depois, deixar arredondar em silêncio é seguro.
+DYNAMODB_CONTEXT.traps[decimal.Inexact] = 0
+DYNAMODB_CONTEXT.traps[decimal.Rounded] = 0
 
 from common import config
 from common.clickhouse_prod import get_clickhouse_client, insert_dataframe
@@ -43,6 +48,18 @@ ENVIADOS_LOG = os.path.join(OUTPUT_DIR, ".enviados.log")
 
 # colunas da tabela, na ordem do insert
 COLUMNS = ["company_id", "process_id", "ts", "index", "threshold"]
+
+HOURS_OFFSET = 3      # Dynamo entrega o ts naive (tratado como UTC); soma 3h, igual ao ADX
+ALT_HOURS_OFFSET = 4  # exceção: +4h (Manaus, UTC-4)
+# process_ids (sem hífen) que usam +4h em vez de +3h
+ALT_PROCESSES = {
+    "668dfaa49d19463e9fb0082f8ae52c2f",
+    "2e7fa9dccd574a1494a95b43ca76d5f2",
+    "567b3498d5d9469681fe1586591fbd9e",
+    "f0c7130974924b70a34b7b9516b1036c",
+    "b2fd0a766acd40819d8e34df4ba81c48",
+    "ef41b354e25948b49667f948694a0957",
+}
 
 _deserializer = TypeDeserializer()
 
@@ -132,8 +149,14 @@ def read_file(path: str, limit: int | None):
 
 def to_dataframe(records: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(records, columns=COLUMNS)
-    if not df.empty:
-        df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    if df.empty:
+        return df
+    # +3h em todos; +1h extra (=+4h) nos process_ids de Manaus
+    df["ts"] = pd.to_datetime(df["ts"], utc=True) + pd.Timedelta(hours=HOURS_OFFSET)
+    extra = ALT_HOURS_OFFSET - HOURS_OFFSET
+    if extra:
+        manaus = df["process_id"].astype(str).str.replace("-", "", regex=False).str.lower().isin(ALT_PROCESSES)
+        df.loc[manaus, "ts"] += pd.Timedelta(hours=extra)
     return df
 
 
@@ -142,7 +165,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Lê e transforma, mostra amostra e estatísticas, NÃO insere.")
     parser.add_argument("--file", help="Processa só este arquivo .gz (valida o 1º antes dos demais).")
     parser.add_argument("--limit", type=int, help="Processa só as N primeiras linhas de cada arquivo.")
-    parser.add_argument("--no-optimize", action="store_true", help="Não roda OPTIMIZE TABLE ... FINAL ao fim da carga real.")
+    parser.add_argument("--optimize", action="store_true", help="Roda OPTIMIZE TABLE ... FINAL ao fim (DESLIGADO por padrão em prod).")
     args = parser.parse_args()
 
     files = discover_files(DUMP_DIR, args.file)
@@ -218,7 +241,7 @@ def main():
             write_enviados_log(ENVIADOS_LOG, entries)   # vai atualizando o log a cada arquivo
         print()
 
-    if not args.dry_run and total_insert > 0 and not args.no_optimize:
+    if not args.dry_run and total_insert > 0 and args.optimize:
         optimize_table(client)
 
     elapsed_all = (time.time() - start_all) / 60
