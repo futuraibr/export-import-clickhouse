@@ -83,24 +83,30 @@ COMPANY_ID_PROD={company_id} python sources/dynamo/variables/import_variables_js
 
 ## 5) export readings (ClickHouse → CSV)
 
-Caminho **inverso** dos outros: puxa dados que já estão no ClickHouse de produção e grava num CSV, filtrando por empresa e período.
+Caminho **inverso** dos outros: puxa dados que já estão no ClickHouse de produção e grava num CSV, filtrando por empresa, período e (opcional) lista de tags. A configuração vem de um **arquivo `.yaml`** (não é mais por linha de comando).
 
 ```bash
-python sources/clickhouse/export_csv_readings_prod.py \
-  --company-id 3c77195204214c7caf3012ba77c3633e \
-  --start "2025-08-20 11:00:00" \
-  --end   "2025-08-20 12:00:00"
+python sources/clickhouse/export_csv_readings_prod.py             # lê ./export_config.yaml
+python sources/clickhouse/export_csv_readings_prod.py meu.yaml    # ou aponta o arquivo
 ```
-> **Os três filtros são obrigatórios** (`--company-id`, `--start`, `--end`). Faltando qualquer um, o script aborta na hora, sem conectar nem gerar nada.
-> `--start` / `--end` são **data e hora** no formato `YYYY-MM-DD HH:MM:SS` (com aspas, por causa do espaço). O período é **inclusivo nas duas pontas**.
+
+Modelo do YAML (veja [export_config.example.yaml](sources/clickhouse/export_config.example.yaml)):
+```yaml
+COMPANY_ID: 3c77195204214c7caf3012ba77c3633e
+DATE_INI: 2026-06-25-11:00        # YYYY-MM-DD-HH:MM (segundos opcionais; padrão :00)
+DATE_END: 2026-06-25-12:00
+NO_FINAL: false                   # opcional: true = mais rápido, pode duplicar
+TAGS:                             # opcional: sem o bloco, traz TODAS as tags
+  - CA-H1_CAO
+  - CA-H1_AL2O3
+```
+> **Obrigatórios:** `COMPANY_ID`, `DATE_INI`, `DATE_END`. Data/valor inválido → aborta sem conectar. Período **inclusivo nas duas pontas**.
+> **Conexão:** no script do **repo** é **opcional** no YAML — sem o bloco `HOST/USER/…`, usa o `.env` (via `common/config`). Se colocar no YAML, sobrepõe o `.env`.
 > **Fuso:** filtra o `ts` **exatamente como está no banco** (UTC = local+3h). Não há conversão — quem consome o CSV faz a conta de cabeça.
 > **Formato do CSV (wide):** 1ª coluna `TIMESTAMP` (um período por linha); as demais colunas são cada `tag_id` com seus valores. Separador `;` e UTF-8 com BOM (abre certinho no Excel PT-BR).
 > O CSV vai pra `sources/clickhouse/made/prod/` com nome `{company_id}_{início}_a_{fim}.csv`, e cada export é registrado em `output/prod/.recebidos.log`.
 
-Mais rápido, sem deduplicar (pode trazer duplicata se a partição não foi consolidada):
-```bash
-python sources/clickhouse/export_csv_readings_prod.py --company-id <id> --start "<...>" --end "<...>" --no-final
-```
+**Versão standalone** (`sources/clickhouse/export_csv_readings_standalone.py`) — para enviar a quem faz a importação: mesmo YAML, mas **autossuficiente** (não usa o `common/`; só `pip install clickhouse-connect pandas`). Nela a **conexão vai no YAML** (`HOST/PORT/DATABASE/USER/PASSWORD/SECURE`) e a saída respeita `OUT_DIR`. Modelo: [export_config.standalone.example.yaml](sources/clickhouse/export_config.standalone.example.yaml).
 
 ---
 
@@ -112,7 +118,7 @@ python sources/clickhouse/export_csv_readings_prod.py --company-id <id> --start 
 | projections | `sources/dynamo/projections/dump/prod/` | `projections` | de dentro do `.gz` | automático (por partição) |
 | predictions | `sources/dynamo/predictions/dump/prod/` | `predictions` | de dentro do `.gz` | manual (`OPTIMIZE TABLE … FINAL`) |
 | variables | `sources/dynamo/variables/dump/prod/` | `event_readings` | `COMPANY_ID_PROD` (obrigatório) | automático (por partição) |
-| **export readings (→ CSV)** | gera em `sources/clickhouse/made/prod/` | lê de `readings` | `--company-id` (obrigatório) | não se aplica (só leitura) |
+| **export readings (→ CSV)** | gera em `sources/clickhouse/made/prod/` | lê de `readings` | `COMPANY_ID` no `.yaml` | não se aplica (só leitura) |
 
 **Comum aos imports (1–4):** arquivo entra em `dump/prod/` → script processa → move pra `made/prod/` → registra em `output/prod/.enviados.log`. Reexecutar só pega o que ainda está em `dump/prod/`. Flags `--dry-run` / `--file` / `--limit` valem para os imports do Dynamo (projections, predictions, variables).
 

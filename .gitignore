@@ -10,3 +10,10 @@ sources/**/dump/*/*
 sources/**/made/*/*
 sources/**/output/*/*
 !**/.gitkeep
+
+# Configs de export do ClickHouse (podem conter credenciais) — NÃO versionar.
+# Mantém rastreado só o modelo do repo (export_config.example.yaml, sem senha).
+export_config.yaml
+sources/clickhouse/export_config.standalone.example.yaml
+sources/clickhouse/export_config.example.yaml
+sources/clickhouse/export_csv_readings_standalone.py

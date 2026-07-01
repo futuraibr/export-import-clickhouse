@@ -1,12 +1,3 @@
-"""
-Filtros passados na linha de comando (TODOS obrigatórios):
-  --company-id   empresa a puxar
-  --start        início do período (formato "YYYY-MM-DD HH:MM:SS", com aspas)
-  --end          fim do período    (formato "YYYY-MM-DD HH:MM:SS", com aspas)
-  --no-final     (opcional) desliga o FINAL na query (mais rápido, pode trazer duplicata)
-"""
-
-import argparse
 import os
 import sys
 import time
@@ -18,15 +9,19 @@ while _root != os.path.dirname(_root) and not os.path.isdir(os.path.join(_root, 
     _root = os.path.dirname(_root)
 sys.path.insert(0, _root)
 
+import clickhouse_connect
 import pandas as pd
 
 from common import config
-from common.clickhouse_prod import get_clickhouse_client
 from common.progress import SUMMARY_MARKER, upsert_entry
 
-CH_DATABASE    = config.CH_DATABASE_PROD
 READINGS_TABLE = "readings"
-BATCH_ROWS     = config.BATCH_ROWS_PROD
+TS_OUT_FORMAT  = "%Y-%m-%d %H:%M"   # formato do TIMESTAMP na CSV (sem segundos)
+DB_DT_FORMAT   = "%Y-%m-%d %H:%M:%S"
+
+# formatos aceitos nas datas do YAML (com ou sem segundos; '-' ou espaço)
+_DT_INPUT_FORMATS = ("%Y-%m-%d-%H:%M:%S", "%Y-%m-%d-%H:%M",
+                     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
 
 # pastas separadas por ambiente — prod usa a subpasta prod (made/prod, output/prod)
 _BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -34,23 +29,53 @@ MADE_DIR      = os.path.join(_BASE_DIR, "made", "prod")
 OUTPUT_DIR    = os.path.join(_BASE_DIR, "output", "prod")
 RECEBIDOS_LOG = os.path.join(OUTPUT_DIR, ".recebidos.log")
 
-DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# formato do TIMESTAMP na CSV (igual ao exemplo: sem segundos)
-TS_OUT_FORMAT = "%Y-%m-%d %H:%M"
-
-
-def parse_dt(value: str) -> datetime:
-    """Valida o formato "YYYY-MM-DD HH:MM:SS"; erro claro se não bater."""
-    try:
-        return datetime.strptime(value, DT_FORMAT)
-    except ValueError:
-        raise SystemExit(f"ERRO: data/hora inválida: '{value}'. Use o formato \"YYYY-MM-DD HH:MM:SS\".")
+def _to_bool(value, default=False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "sim")
 
 
-def _slug(dt_str: str) -> str:
-    """Deixa a data/hora amigável pra nome de arquivo: mantém a data, tira ':' e troca espaço por '_'."""
-    return dt_str.replace(":", "").replace(" ", "_")
+def load_yaml_config(path: str):
+    """Parser simples do YAML (sem depender de PyYAML): aceita 'CHAVE: valor'
+    (ou 'CHAVE:valor') e uma lista TAGS com itens no formato '- tag'."""
+    if not os.path.exists(path):
+        raise SystemExit(f"ERRO: arquivo de configuração não encontrado: {path}")
+    cfg, tags, in_tags = {}, [], False
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("-"):                      # item de lista (tag)
+                if in_tags:
+                    tag = line[1:].strip().strip('"').strip("'")
+                    if tag:
+                        tags.append(tag)
+                continue
+            key, sep, val = line.partition(":")           # 'CHAVE: valor'
+            key = key.strip().upper()
+            val = val.strip().strip('"').strip("'")
+            if key == "TAGS":
+                in_tags = True
+                continue
+            in_tags = False
+            if sep:
+                cfg[key] = val
+    return cfg, tags
+
+
+def parse_cfg_dt(value: str, field: str) -> datetime:
+    """Lê a data do YAML (YYYY-MM-DD-HH:MM, segundos opcionais → padrão :00)."""
+    v = str(value).strip()
+    for fmt in _DT_INPUT_FORMATS:
+        try:
+            return datetime.strptime(v, fmt)
+        except ValueError:
+            continue
+    raise SystemExit(
+        f"ERRO: {field} inválido: '{value}'. Use 'YYYY-MM-DD-HH:MM' (segundos opcionais, ex.: 2026-06-25-11:00)."
+    )
 
 
 def load_recebidos(log_path: str) -> list[dict]:
@@ -105,20 +130,26 @@ def write_recebidos_log(log_path: str, entries: list[dict]):
         f.write(f"{SUMMARY_MARKER}\n")
 
 
-def export_to_csv(client, company_id: str, start: str, end: str, use_final: bool, out_path: str) -> int:
+def export_to_csv(client, database, company_id, start, end, tags, use_final, out_path) -> int:
     """Puxa a fatia da readings e grava em CSV no formato WIDE (pivot):
     1ª coluna TIMESTAMP (um período por linha), demais colunas = cada tag_id com seus valores.
     Devolve o número de linhas (períodos) da CSV."""
     final = "FINAL" if use_final else ""
+    params = {"company_id": company_id, "start": start, "end": end}
+    tag_clause = ""
+    if tags:
+        tag_clause = "AND tag_id IN {tags:Array(String)}"
+        params["tags"] = tags
+
     query = f"""
         SELECT ts, tag_id, value
-        FROM {CH_DATABASE}.{READINGS_TABLE} {final}
+        FROM {database}.{READINGS_TABLE} {final}
         WHERE company_id = {{company_id:String}}
           AND ts >= {{start:String}}
           AND ts <= {{end:String}}
+          {tag_clause}
         ORDER BY ts, tag_id
     """
-    params = {"company_id": company_id, "start": start, "end": end}
 
     frames = []
     datapoints = 0
@@ -138,59 +169,69 @@ def export_to_csv(client, company_id: str, start: str, end: str, use_final: bool
     wide = long_df.pivot_table(index="ts", columns="tag_id", values="value", aggfunc="first")
     wide = wide.sort_index()
     wide.columns.name = None
-    # TIMESTAMP como 1ª coluna (formato igual ao exemplo, sem segundos)
+    # TIMESTAMP como 1ª coluna (sem segundos)
     wide.insert(0, "TIMESTAMP", wide.index.strftime(TS_OUT_FORMAT))
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    # separador ';' + BOM (utf-8-sig) pra abrir certinho no Excel PT-BR, igual ao exemplo
+    # separador ';' + BOM (utf-8-sig) pra abrir certinho no Excel PT-BR
     wide.to_csv(out_path, index=False, sep=";", encoding="utf-8-sig")
-
     return len(wide)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Exporta a tabela readings (ClickHouse PROD) para CSV, filtrando por empresa e período."
-    )
-    parser.add_argument("--company-id", required=True, help="company_id da empresa a exportar (obrigatório).")
-    parser.add_argument("--start", required=True, help='Início do período "YYYY-MM-DD HH:MM:SS" (obrigatório).')
-    parser.add_argument("--end", required=True, help='Fim do período "YYYY-MM-DD HH:MM:SS" (obrigatório).')
-    parser.add_argument("--no-final", action="store_true", help="Desliga o FINAL na query (mais rápido, pode duplicar).")
-    args = parser.parse_args()
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "export_config.yaml"
+    cfg, tags = load_yaml_config(config_path)
 
-    # valida datas antes de qualquer conexão
-    dt_start = parse_dt(args.start)
-    dt_end = parse_dt(args.end)
-    if dt_start > dt_end:
-        raise SystemExit(f"ERRO: --start ({args.start}) é depois de --end ({args.end}).")
+    # ---- conexão: do YAML se vier; senão do .env (common/config) ----
+    host     = cfg.get("HOST")     or config.CH_HOST_PROD
+    port     = int(cfg.get("PORT") or config.CH_PORT_PROD)
+    database = cfg.get("DATABASE") or config.CH_DATABASE_PROD
+    user     = cfg.get("USER")     or config.CH_USER_PROD
+    password = cfg.get("PASSWORD") or config.CH_PASSWORD_PROD
+    secure   = _to_bool(cfg.get("SECURE"), True) if "SECURE" in cfg else config.CH_SECURE_PROD
 
-    company_id = args.company_id.strip()
-    use_final = not args.no_final
-    period_label = f"{args.start} → {args.end}"
+    # ---- filtros (obrigatórios) ----
+    company_id = (cfg.get("COMPANY_ID") or "").strip()
+    if not company_id:
+        raise SystemExit("ERRO: COMPANY_ID é obrigatório no YAML.")
+    if "DATE_INI" not in cfg or "DATE_END" not in cfg:
+        raise SystemExit("ERRO: DATE_INI e DATE_END são obrigatórios no YAML.")
 
-    out_name = f"{company_id}_{_slug(args.start)}_a_{_slug(args.end)}.csv"
+    dt_ini = parse_cfg_dt(cfg["DATE_INI"], "DATE_INI")
+    dt_end = parse_cfg_dt(cfg["DATE_END"], "DATE_END")
+    if dt_ini > dt_end:
+        raise SystemExit(f"ERRO: DATE_INI ({cfg['DATE_INI']}) é depois de DATE_END ({cfg['DATE_END']}).")
+    start = dt_ini.strftime(DB_DT_FORMAT)
+    end   = dt_end.strftime(DB_DT_FORMAT)
+
+    use_final    = not _to_bool(cfg.get("NO_FINAL"), False)
+    period_label = f"{start} → {end}"
+    out_name = f"{company_id}_{dt_ini.strftime('%Y-%m-%d_%H%M%S')}_a_{dt_end.strftime('%Y-%m-%d_%H%M%S')}.csv"
     out_path = os.path.join(MADE_DIR, out_name)
 
     print(f"\n{'='*57}")
-    print(f"  Host       : {config.CH_HOST_PROD}:{config.CH_PORT_PROD}")
-    print(f"  Tabela     : {CH_DATABASE}.{READINGS_TABLE}{' FINAL' if use_final else ''}")
+    print(f"  Config     : {config_path}")
+    print(f"  Host       : {host}:{port}")
+    print(f"  Tabela     : {database}.{READINGS_TABLE}{' FINAL' if use_final else ''}")
     print(f"  Empresa    : {company_id}")
     print(f"  Período    : {period_label}  (ts do banco, sem conversão)")
+    print(f"  Tags       : {len(tags) if tags else 'TODAS'}")
     print(f"  Saída      : {out_path}")
     print(f"{'='*57}\n")
 
-    client = get_clickhouse_client()
+    client = clickhouse_connect.get_client(
+        host=host, port=port, username=user, password=password, database=database, secure=secure,
+    )
     print("Conexão com ClickHouse OK\n")
 
     t0 = time.time()
-    total = export_to_csv(client, company_id, args.start, args.end, use_final, out_path)
+    total = export_to_csv(client, database, company_id, start, end, tags, use_final, out_path)
     elapsed = time.time() - t0
 
     if total == 0:
-        # não deixa CSV vazio nem registra no log
         if os.path.exists(out_path):
             os.remove(out_path)
-        print(f"\nNenhuma linha no período para essa empresa — nada exportado.")
+        print("\nNenhuma linha no período/tags para essa empresa — nada exportado.")
         print(f"{'='*57}\n")
         return
 
@@ -206,7 +247,7 @@ def main():
 
     print(f"\n{'='*57}")
     print(f"  Concluído em     : {elapsed:.1f}s")
-    print(f"  Linhas exportadas: {total:,}")
+    print(f"  Linhas (períodos): {total:,}")
     print(f"  Arquivo          : {out_path}")
     print(f"  Log de recebidos : {RECEBIDOS_LOG}")
     print(f"{'='*57}\n")
