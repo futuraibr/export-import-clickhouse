@@ -1,8 +1,4 @@
-"""[PROD] Exporta a tabela `readings` do ClickHouse de PRODUÇÃO para CSV no formato WIDE.
-
-A CSV sai pivotada: 1ª coluna TIMESTAMP (um período por linha) e as demais colunas são
-cada tag_id com seus valores naquele período. Separador ';' e UTF-8 com BOM (Excel PT-BR).
-
+"""
 Filtros passados na linha de comando (TODOS obrigatórios):
   --company-id   empresa a puxar
   --start        início do período (formato "YYYY-MM-DD HH:MM:SS", com aspas)
