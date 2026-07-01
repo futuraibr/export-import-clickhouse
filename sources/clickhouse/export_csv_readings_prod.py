@@ -1,7 +1,7 @@
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 # acha a raiz do projeto pra conseguir importar o common/
 _root = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +36,14 @@ def _to_bool(value, default=False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "sim")
 
 
+def _strip_inline_comment(s: str) -> str:
+    """Remove comentário inline (' # ...'), preservando '#' colado no valor (ex.: tag CA-H1_#170)."""
+    for i, ch in enumerate(s):
+        if ch == "#" and (i == 0 or s[i - 1] in " \t"):
+            return s[:i].rstrip()
+    return s
+
+
 def load_yaml_config(path: str):
     """Parser simples do YAML (sem depender de PyYAML): aceita 'CHAVE: valor'
     (ou 'CHAVE:valor') e uma lista TAGS com itens no formato '- tag'."""
@@ -49,13 +57,13 @@ def load_yaml_config(path: str):
                 continue
             if line.startswith("-"):                      # item de lista (tag)
                 if in_tags:
-                    tag = line[1:].strip().strip('"').strip("'")
+                    tag = _strip_inline_comment(line[1:].strip()).strip().strip('"').strip("'")
                     if tag:
                         tags.append(tag)
                 continue
             key, sep, val = line.partition(":")           # 'CHAVE: valor'
             key = key.strip().upper()
-            val = val.strip().strip('"').strip("'")
+            val = _strip_inline_comment(val.strip()).strip().strip('"').strip("'")
             if key == "TAGS":
                 in_tags = True
                 continue
@@ -201,6 +209,15 @@ def main():
     dt_end = parse_cfg_dt(cfg["DATE_END"], "DATE_END")
     if dt_ini > dt_end:
         raise SystemExit(f"ERRO: DATE_INI ({cfg['DATE_INI']}) é depois de DATE_END ({cfg['DATE_END']}).")
+    # o ts no banco está em UTC; não há dado no futuro
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    if dt_ini > now_utc:
+        raise SystemExit(
+            f"ERRO: DATE_INI ({cfg['DATE_INI']}) está no futuro (agora: {now_utc:%Y-%m-%d %H:%M} UTC) — não há dados a partir daí."
+        )
+    if dt_end > now_utc:                                   # fim no futuro: corta até agora e avisa
+        print(f"AVISO: DATE_END ({cfg['DATE_END']}) está no futuro; ajustando para agora ({now_utc:%Y-%m-%d %H:%M} UTC).\n")
+        dt_end = now_utc
     start = dt_ini.strftime(DB_DT_FORMAT)
     end   = dt_end.strftime(DB_DT_FORMAT)
 
